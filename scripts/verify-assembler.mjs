@@ -1444,7 +1444,7 @@ function buildCacheControl(env) {
 
 function buildAutomaticCacheControl(env) {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
-  if (env.ANTHROPIC_AUTO_CACHE_ENABLED === "false") return undefined;
+  if (env.ANTHROPIC_AUTO_CACHE_ENABLED !== "true") return undefined;
   return buildCacheControl(env);
 }
 
@@ -1472,12 +1472,43 @@ function applyRollingMessageCache(messages, env) {
   }
 }
 
+function appendUncachedUserContext(messages, text) {
+  const trimmed = text?.trim();
+  if (!trimmed) return;
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role !== "user") continue;
+    message.content.push({ type: "text", text: trimmed });
+    return;
+  }
+
+  messages.push({ role: "user", content: [{ type: "text", text: trimmed }] });
+}
+
+function splitDynamicMemorySystemBlock(assembled) {
+  const idx = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
+  if (idx < 0 || idx >= assembled.system_blocks.length) {
+    return { systemBlocks: assembled.system_blocks, dynamicMemoryPatch: null };
+  }
+
+  return {
+    systemBlocks: [
+      ...assembled.system_blocks.slice(0, idx),
+      ...assembled.system_blocks.slice(idx + 1),
+    ],
+    dynamicMemoryPatch: assembled.system_blocks[idx].text,
+  };
+}
+
 function buildAnthropicRequestFromAssembled(req, targetModel, assembled, env) {
   const thinking = buildThinkingConfig(env, req);
-  const system = assembledToAnthropicSystem(assembled.system_blocks);
+  const { systemBlocks, dynamicMemoryPatch } = splitDynamicMemorySystemBlock(assembled);
+  const system = assembledToAnthropicSystem(systemBlocks);
   applyCacheOverrides(system, env);
   const messages = assembledToAnthropicMessages(assembled.messages);
   applyRollingMessageCache(messages, env);
+  appendUncachedUserContext(messages, dynamicMemoryPatch);
   return {
     model: targetModel.replace(/^anthropic\//i, ""),
     max_tokens: getAnthropicMaxTokens(req, env),
@@ -1573,8 +1604,7 @@ check("Anthropic helper: rolling cache_control lands on latest user message", ()
     {}
   );
   const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
-  const lastBlock = lastUser.content[lastUser.content.length - 1];
-  assert.deepStrictEqual(lastBlock.cache_control, { type: "ephemeral" });
+  assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral" });
 });
 
 check("Anthropic helper: full rolling window restarts cache on first user message", () => {
@@ -1601,6 +1631,30 @@ check("Anthropic helper: full rolling window restarts cache on first user messag
   assert.strictEqual(firstUser.content[0].text, "窗口第一条用户消息");
   assert.deepStrictEqual(firstUserBlock.cache_control, { type: "ephemeral" });
   assert.strictEqual(lastUserBlock.cache_control, undefined);
+});
+
+check("Anthropic helper: dynamic memory is appended after rolling cache point", () => {
+  const ctx = makeBaseCtx();
+  ctx.ragMemories = [
+    { type: "note", importance: 0.8, content: "用户喜欢缓存命中率高一点" },
+  ];
+  ctx.currentUserMessage = { role: "user", content: "继续优化缓存" };
+  const assembled = assemble(ctx);
+  const req = buildAnthropicRequestFromAssembled(
+    { messages: [] },
+    "anthropic/claude-sonnet-4-6",
+    assembled,
+    {}
+  );
+
+  assert.ok(!req.system.some((b) => b.text.includes("用户喜欢缓存命中率高一点")));
+
+  const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
+  assert.ok(lastUser);
+  assert.strictEqual(lastUser.content[0].text, "继续优化缓存");
+  assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral" });
+  assert.ok(lastUser.content[1].text.includes("用户喜欢缓存命中率高一点"));
+  assert.strictEqual(lastUser.content[1].cache_control, undefined);
 });
 
 check("Anthropic helper: ANTHROPIC_CACHE_ENABLED=false removes cache_control", () => {
@@ -1634,11 +1688,10 @@ check("Anthropic helper: ANTHROPIC_CACHE_TTL=1h sets ttl=1h", () => {
   assert.ok(anchor);
   assert.deepStrictEqual(anchor.cache_control, { type: "ephemeral", ttl: "1h" });
   const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
-  const lastBlock = lastUser.content[lastUser.content.length - 1];
-  assert.deepStrictEqual(lastBlock.cache_control, { type: "ephemeral", ttl: "1h" });
+  assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral", ttl: "1h" });
 });
 
-check("Anthropic helper: defaults ttl to 5m", () => {
+check("Anthropic helper: defaults to stable system plus rolling cache", () => {
   const ctx = makeBaseCtx();
   const assembled = assemble(ctx);
   const req = buildAnthropicRequestFromAssembled(
@@ -1650,6 +1703,22 @@ check("Anthropic helper: defaults ttl to 5m", () => {
   const anchor = req.system.find((b) => b.cache_control);
   assert.ok(anchor);
   assert.deepStrictEqual(anchor.cache_control, { type: "ephemeral", ttl: "5m" });
+  assert.strictEqual(req.cache_control, undefined);
+  const userBlocksWithCache = req.messages
+    .flatMap((m) => m.content)
+    .filter((b) => b.cache_control);
+  assert.strictEqual(userBlocksWithCache.length, 1);
+});
+
+check("Anthropic helper: automatic cache is opt-in", () => {
+  const ctx = makeBaseCtx();
+  const assembled = assemble(ctx);
+  const req = buildAnthropicRequestFromAssembled(
+    { messages: [] },
+    "anthropic/claude-sonnet-4-6",
+    assembled,
+    { ANTHROPIC_AUTO_CACHE_ENABLED: "true" }
+  );
   assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
 });
 
@@ -1671,10 +1740,12 @@ check("Anthropic helper: structured content stringified (temporary fallback)", (
   );
   const last = req.messages[req.messages.length - 1];
   assert.strictEqual(last.role, "user");
-  assert.strictEqual(last.content.length, 1);
+  assert.strictEqual(last.content.length, 2);
   assert.strictEqual(last.content[0].type, "text");
   const parsed = JSON.parse(last.content[0].text);
   assert.strictEqual(parsed[1].type, "image_url");
+  assert.ok(last.content[1].text.includes("<memories>"));
+  assert.strictEqual(last.content[1].cache_control, undefined);
 });
 
 check("Anthropic helper: model prefix stripped", () => {

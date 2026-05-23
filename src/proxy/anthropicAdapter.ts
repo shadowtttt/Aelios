@@ -81,7 +81,7 @@ function buildCacheControl(env: Env): AnthropicTextBlock["cache_control"] | unde
 
 function buildAutomaticCacheControl(env: Env): AnthropicRequest["cache_control"] | undefined {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return undefined;
-  if (env.ANTHROPIC_AUTO_CACHE_ENABLED === "false") return undefined;
+  if (env.ANTHROPIC_AUTO_CACHE_ENABLED !== "true") return undefined;
   return buildCacheControl(env);
 }
 
@@ -94,8 +94,8 @@ function getRollingCacheWindowSize(env: Env): number {
 export function getAnthropicCacheMode(env: Env): string | null {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return null;
   const parts = ["anthropic"];
-  if (env.ANTHROPIC_AUTO_CACHE_ENABLED !== "false") parts.push("auto");
   parts.push("explicit");
+  if (env.ANTHROPIC_AUTO_CACHE_ENABLED === "true") parts.push("auto");
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED !== "false") parts.push("rolling");
   return parts.join("_");
 }
@@ -116,6 +116,37 @@ function applyRollingMessageCache(messages: AnthropicMessage[], env: Env): void 
     message.content[message.content.length - 1].cache_control = cacheControl;
     return;
   }
+}
+
+function appendUncachedUserContext(messages: AnthropicMessage[], text: string | null | undefined): void {
+  const trimmed = text?.trim();
+  if (!trimmed) return;
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role !== "user") continue;
+    message.content.push({ type: "text", text: trimmed });
+    return;
+  }
+
+  messages.push({ role: "user", content: [{ type: "text", text: trimmed }] });
+}
+
+function splitDynamicMemorySystemBlock(
+  assembled: AssembledPrompt
+): { systemBlocks: AssembledPrompt["system_blocks"]; dynamicMemoryPatch: string | null } {
+  const idx = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
+  if (idx < 0 || idx >= assembled.system_blocks.length) {
+    return { systemBlocks: assembled.system_blocks, dynamicMemoryPatch: null };
+  }
+
+  return {
+    systemBlocks: [
+      ...assembled.system_blocks.slice(0, idx),
+      ...assembled.system_blocks.slice(idx + 1),
+    ],
+    dynamicMemoryPatch: assembled.system_blocks[idx].text,
+  };
 }
 
 function getMaxTokens(req: OpenAIChatRequest): number {
@@ -340,15 +371,9 @@ export async function buildAnthropicNativeRequest(
     stableBlock
   ];
 
-  if (dynamicMemoryPatch) {
-    system.push({
-      type: "text",
-      text: dynamicMemoryPatch
-    });
-  }
-
   const messages = convertMessages(req.messages);
   applyRollingMessageCache(messages, input.env);
+  appendUncachedUserContext(messages, dynamicMemoryPatch);
 
   return {
     model: stripAnthropicModelPrefix(input.targetModel),
@@ -368,8 +393,10 @@ export async function buildAnthropicNativeRequest(
  * - System blocks are converted via assembledToAnthropicSystem
  * - Messages via assembledToAnthropicMessages
  *   (structured content like image_url is JSON.stringify'd — temporary fallback)
+ * - dynamic_memory_patch is moved out of system and appended after the
+ *   rolling cache point, so changing RAG hits do not poison cached prefixes
  * - cache_control is applied to the client_system anchor block and the
- *   latest user message, respecting ANTHROPIC_CACHE_ENABLED and
+ *   rolling user/window block, respecting ANTHROPIC_CACHE_ENABLED and
  *   ANTHROPIC_CACHE_TTL
  */
 export function buildAnthropicRequestFromAssembled(
@@ -379,10 +406,12 @@ export function buildAnthropicRequestFromAssembled(
   env: Env
 ): AnthropicRequest {
   const thinking = buildThinkingConfig(env, req);
-  const system = assembledToAnthropicSystem(assembled.system_blocks);
+  const { systemBlocks, dynamicMemoryPatch } = splitDynamicMemorySystemBlock(assembled);
+  const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
   applyCacheOverrides(system, env);
   applyRollingMessageCache(messages, env);
+  appendUncachedUserContext(messages, dynamicMemoryPatch);
 
   return {
     model: stripAnthropicModelPrefix(targetModel),

@@ -340,8 +340,8 @@ Model:      companion
 | `ANTHROPIC_THINKING_BUDGET` | `1024` | 思考 token 预算（1024-32000） |
 | `ANTHROPIC_CACHE_TTL` | `5m` | Prompt cache 时长（`5m` 或 `1h`） |
 | `ANTHROPIC_CACHE_ENABLED` | `true` | 设 `false` 关闭 cache |
-| `ANTHROPIC_AUTO_CACHE_ENABLED` | `true` | 开启 Anthropic 顶层自动缓存，让多轮历史像 Claude Code 一样向后滚动缓存 |
-| `ANTHROPIC_ROLLING_CACHE_ENABLED` | `true` | 显式滚动 cache 打点。未满窗口时打在最后一条 user；达到窗口上限后打在当前窗口第一条 user，相当于从新窗口开头重新建缓存段 |
+| `ANTHROPIC_AUTO_CACHE_ENABLED` | `false` | 设 `true` 才开启 Anthropic 顶层 automatic cache。默认关闭，避免历史前缀变化时反复重建缓存 |
+| `ANTHROPIC_ROLLING_CACHE_ENABLED` | `true` | 显式滚动 cache 打点。未满窗口时打在最后一条 user；达到窗口上限后打在当前窗口第一条 user。设 `false` 可关闭 |
 | `ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE` | `20` | 前端保留的历史窗口大小。Chatbox 日志里 `historyCount=20` 时可保持默认 |
 | `FORCE_ANTHROPIC_NATIVE` | 空 | 设 `true` 强制所有模型走 Anthropic native |
 | `CUSTOM_ANTHROPIC_MESSAGES_PATH` | `messages` | custom Claude 的原生 messages 路径 |
@@ -572,9 +572,9 @@ Dimensions:  768 (如覆盖 EMBEDDING_MODEL，输出维度仍需匹配)
 
 目标模型名含 anthropic 或 claude
   -> Anthropic native: <AI_GATEWAY_BASE_URL>/anthropic/v1/messages
-  -> 顶层 automatic cache_control 负责缓存增长中的多轮历史
   -> 显式 cache_control on client_system block 负责缓存稳定 system 前缀
-  -> 显式 cache_control on last user block 负责滚动缓存对话历史
+  -> dynamic_memory_patch 会后移到当前 user 内容块，不进入历史缓存前缀
+  -> rolling user cache_control 默认开启，automatic cache_control 默认关闭
   -> cf-aig-skip-cache: true
 
 目标模型名是 custom-provider/claude-opus-4-7 这类 custom Claude
@@ -615,13 +615,13 @@ messages:
 
 前端如果把 `Current date: ...`、`当前时间：...` 这类每轮都会变化的内容塞在 system 顶部，assembler 会把这些行拆到 `client_volatile_context`。它仍然会发给模型，但会排在 `client_system` 的显式 cache anchor 后面，避免单个时间变量把稳定角色卡和规则缓存全部打穿。
 
-默认会同时使用三层 Claude prompt cache：
+默认使用两层 Claude prompt cache：
 
-- 顶层 automatic `cache_control`：Anthropic 会自动把缓存断点放到最后一个可缓存 block，并随着多轮历史增长向后推进。这更接近 Claude Code 的命中形态。
 - 显式 `cache_control`：仍然落在 client_system（block 5），保证前面的 stable blocks 有独立缓存。
-- 滚动显式 `cache_control`：未满历史窗口时额外落在最后一条 user 内容上；达到 `ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE` 后，改落在当前窗口第一条 user 内容上，让被前端截断后的新窗口从开头重新建立缓存段。
+- 滚动显式 `cache_control`：默认开启。未满历史窗口时落在最后一条 user 内容上；达到 `ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE` 后，改落在当前窗口第一条 user 内容上，相当于满 20 条后从头重新建缓存段。
+- 顶层 automatic `cache_control`：默认关闭。设 `ANTHROPIC_AUTO_CACHE_ENABLED=true` 后才启用。
 
-动态记忆 `dynamic_memory_patch` 排在 `client_system` cache anchor 后面，本身不带显式 `cache_control`；稳定角色卡、摘要、固定规则优先由 `client_system` 这个断点保护。
+动态记忆 `dynamic_memory_patch` 在 assembler 里仍是独立 block；走 Anthropic native 时，会从 `system` 里摘出来，追加到当前 user 内容块末尾。这样 Claude 能看到本轮召回的记忆，但它不会出现在 system cache 或历史 rolling cache 的前缀里。
 
 tool/tool_calls 请求 fallback 到旧路径，assembler 不处理 tool。
 
