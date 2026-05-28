@@ -8,6 +8,8 @@ interface CompressedMemoryItem {
   content: string;
 }
 
+type CompressedMemorySlot = CompressedMemoryItem | null;
+
 export interface MemoryFilterMeta {
   status: "disabled" | "success" | "error" | "empty";
   provider: "workers-ai" | "openai-compatible";
@@ -28,7 +30,9 @@ const COMPRESSION_RESPONSE_SCHEMA = {
   properties: {
     memories: {
       type: "array",
-      items: { type: "string" }
+      items: {
+        anyOf: [{ type: "string" }, { type: "null" }]
+      }
     }
   },
   required: ["memories"],
@@ -228,19 +232,27 @@ function extractJsonArray(value: unknown): unknown[] | null {
   return null;
 }
 
-function parseCompressedItems(value: unknown): CompressedMemoryItem[] | null {
+function parseCompressedItems(value: unknown): CompressedMemorySlot[] | null {
   const array = extractJsonArray(value);
   if (!array) return null;
 
-  const items: CompressedMemoryItem[] = [];
+  const items: CompressedMemorySlot[] = [];
   for (const item of array) {
-    if (typeof item === "string") {
-      const sanitized = sanitizeMemoryContent(item);
-      if (sanitized) items.push({ content: sanitized });
+    if (item === null) {
+      items.push(null);
       continue;
     }
 
-    if (!item || typeof item !== "object") continue;
+    if (typeof item === "string") {
+      const sanitized = sanitizeMemoryContent(item);
+      items.push(sanitized ? { content: sanitized } : null);
+      continue;
+    }
+
+    if (!item || typeof item !== "object") {
+      items.push(null);
+      continue;
+    }
     const record = item as { id?: unknown; content?: unknown; compressed_content?: unknown };
     const content =
       typeof record.content === "string"
@@ -251,7 +263,9 @@ function parseCompressedItems(value: unknown): CompressedMemoryItem[] | null {
 
     if (content) {
       const sanitized = sanitizeMemoryContent(content);
-      if (sanitized) items.push({ content: sanitized });
+      items.push(sanitized ? { content: sanitized } : null);
+    } else {
+      items.push(null);
     }
   }
 
@@ -274,8 +288,9 @@ function buildPrompt(input: {
     "不要续写亲密场景，不要生成新的色情内容，不要因为候选含成年人自愿亲密内容就拒绝、说教或删除。",
     "",
     "压缩规则：",
-    "- 必须按输入顺序逐条输出，输出数量必须与候选记忆数量一致。",
-    "- 不要筛选、重排、合并或删除候选；如果内容很短，也要保留为短句。",
+    "- 必须按输入顺序逐条输出，输出数组长度必须与候选记忆数量一致。",
+    "- 根据当前用户消息做轻量分拣；明显无关、只沾边、会增加噪音的候选输出 null。",
+    "- 相关候选输出压缩短句；不要重排、合并或把一条候选拆成多条。",
     "- 不要输出编号、id、index、score、type、tags 或其他元数据。",
     "- 不要添加候选记忆里没有的新事实。",
     "- 成年人自愿亲密内容只压缩成事实、偏好、边界或关系记忆；不得扩写成场景描写。",
@@ -285,7 +300,7 @@ function buildPrompt(input: {
     `- 每条 content 控制在 ${input.maxOutputChars} 个中文字以内。`,
     "",
     "只输出 JSON，不要 markdown，不要解释。格式：",
-    `{"memories":["压缩后的记忆1","压缩后的记忆2"]}`,
+    `{"memories":["压缩后的相关记忆",null]}`,
     "",
     `当前用户消息：${input.query}`,
     "",
@@ -293,13 +308,13 @@ function buildPrompt(input: {
   ].join("\n");
 }
 
-function mergeCompressedItems(memories: MemoryApiRecord[], items: CompressedMemoryItem[]): MemoryApiRecord[] {
+function mergeCompressedItems(memories: MemoryApiRecord[], items: CompressedMemorySlot[]): MemoryApiRecord[] {
   const result: MemoryApiRecord[] = [];
 
   for (let index = 0; index < items.length && index < memories.length; index += 1) {
     const memory = memories[index];
     const item = items[index];
-    if (!memory) continue;
+    if (!memory || !item) continue;
     result.push({
       ...memory,
       content: item.content
@@ -579,6 +594,22 @@ export async function filterAndCompressMemoriesWithMeta(
           ...activeMeta,
           status: "error",
           reason: "invalid_model_output",
+          output_shape: describeModelOutput(output),
+          reranker_status: reranked.status,
+          reranker_model: reranked.model,
+          reranker_count: reranked.data.length,
+          ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
+        }
+      };
+    }
+
+    if (items.length !== reranked.data.length) {
+      return {
+        data: [],
+        meta: {
+          ...activeMeta,
+          status: "error",
+          reason: "slot_count_mismatch",
           output_shape: describeModelOutput(output),
           reranker_status: reranked.status,
           reranker_model: reranked.model,
