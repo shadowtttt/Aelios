@@ -522,6 +522,48 @@ https://<worker>/memory-admin
 
 面板在浏览器里保存 Worker URL 和 API key，只作为本地管理工具使用。它调用同一套 REST API，可以搜索、列表、创建、编辑、删除 Vectorize 长期记忆，也可以运行 `vector_health` 和按页 `vector_reindex`。
 
+如果旧 Vectorize 里已经有很多长块、多主题块、重复总结，可以让 LLM 先生成清洗计划：
+
+```bash
+AELIOS_BASE_URL="https://<worker>" \
+AELIOS_API_KEY="<CHATBOX_API_KEY>" \
+AI_GATEWAY_BASE_URL="<AI Gateway Endpoint>" \
+CF_AIG_TOKEN="<AI Gateway Token>" \
+CLEANUP_MODEL="deepseek/deepseek-v4-flash" \
+npm run vectorize:clean:llm
+```
+
+如果只是临时清库，也可以不走 Cloudflare AI Gateway，直接走任意 OpenAI-compatible API：
+
+```bash
+AELIOS_BASE_URL="https://<worker>" \
+AELIOS_API_KEY="<CHATBOX_API_KEY>" \
+CLEANUP_OPENAI_BASE_URL="https://<openai-compatible-host>/v1" \
+CLEANUP_API_KEY="<model api key>" \
+CLEANUP_MODEL="mimo-v2.5-pro" \
+npm run vectorize:clean:llm
+```
+
+这个命令默认只会导出备份和计划到 `backups/`，不会改动线上记忆库。确认计划没问题后，再执行：
+
+```bash
+npm run vectorize:clean:llm -- --apply-plan backups/llm-clean-vectorize-plan-<时间>.json
+```
+
+常用调试参数：
+
+```bash
+npm run vectorize:clean:llm -- --limit-batches 1
+CLEANUP_MIN_CHARS=700 npm run vectorize:clean:llm
+CLEANUP_BATCH_SIZE=3 npm run vectorize:clean:llm
+CLEANUP_CONCURRENCY=4 npm run vectorize:clean:llm
+CLEANUP_SCOPE=all CLEANUP_CONCURRENCY=4 npm run vectorize:clean:llm
+```
+
+`backups/` 已在 `.gitignore` 里，不会被提交。它会包含原始记忆内容，用完可以删除。
+
+清洗计划会把稳定事实、偏好、关系规则整理成短记忆；如果旧块里本来就带有原对话小段，会另存为 `type: "excerpt"` 原文 chunk，并带 `original-dialogue` 标签，和普通总结记忆分开检索、分开管理。原文前缀使用 `咲咲/旦九对话原文：`、`咲咲原话：` 或 `旦九原话：`。
+
 手动补跑 dream：
 
 ```bash

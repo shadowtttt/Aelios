@@ -170,7 +170,7 @@ async function decideMemoryMerge(
   incoming: ExtractedMemory,
   candidates: MemoryApiRecord[]
 ): Promise<MemoryMergeDecision> {
-  const model = env.DREAM_MODEL;
+  const model = env.DREAM_MODEL || env.DAILY_DIGEST_MODEL || env.SUMMARY_MODEL;
   if (!model || candidates.length === 0) {
     return chooseFallbackDecision(incoming, candidates);
   }

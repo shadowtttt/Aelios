@@ -18,7 +18,7 @@ function getDailyDigestNamespace(env: Env): string {
 }
 
 function getDailyDigestMaxRuns(env: Env): number {
-  const parsed = Number(env.DREAM_MAX_RUNS || 3);
+  const parsed = Number(env.DREAM_MAX_RUNS || env.DAILY_DIGEST_MAX_RUNS || 3);
   if (!Number.isFinite(parsed)) return 3;
   return Math.min(Math.max(Math.floor(parsed), 1), 10);
 }

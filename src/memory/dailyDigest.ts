@@ -57,6 +57,36 @@ interface DailyDigestStats {
   hasMore: boolean;
 }
 
+type DailyDigestSkipReason =
+  | "dream_disabled"
+  | "already_done"
+  | "no_messages"
+  | "missing_model"
+  | "model_error"
+  | "model_invalid_json";
+
+interface DailyDigestSkipped {
+  ran: false;
+  mode: "dream";
+  date?: string;
+  reason: DailyDigestSkipReason;
+  startIso?: string;
+  endIso?: string;
+  cursor?: string | null;
+  processedMessages?: number;
+  model?: string;
+  status?: number;
+}
+
+type DailyDigestRunResult = { ran: true; stats: DailyDigestStats } | DailyDigestSkipped;
+
+interface DigestModelCallResult {
+  digest: DailyDigestResult | null;
+  reason?: Extract<DailyDigestSkipReason, "missing_model" | "model_error" | "model_invalid_json">;
+  model?: string;
+  status?: number;
+}
+
 const DEFAULT_MAX_MESSAGES = 320;
 const DEFAULT_MEMORY_CONTEXT_LIMIT = 250;
 const DEFAULT_EXCERPT_LIMIT = 8;
@@ -65,7 +95,49 @@ const DEFAULT_TIME_ZONE = "Asia/Singapore";
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 function isDreamEnabled(env: Env): boolean {
-  return env.ENABLE_DREAM !== "false";
+  const dreamFlag = readString(env.ENABLE_DREAM);
+  if (dreamFlag) return dreamFlag !== "false";
+  return env.ENABLE_DAILY_MEMORY_DIGEST !== "false";
+}
+
+function readFirstEnvValue(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function readDreamModel(env: Env): string | null {
+  return readString(readFirstEnvValue(env.DREAM_MODEL, env.DAILY_DIGEST_MODEL, env.SUMMARY_MODEL));
+}
+
+function readDreamTimeZone(env: Env): string {
+  return readString(readFirstEnvValue(env.DREAM_TIME_ZONE, env.DAILY_DIGEST_TIME_ZONE)) || DEFAULT_TIME_ZONE;
+}
+
+function readDreamMaxMessages(env: Env): number {
+  return readPositiveInt(
+    readFirstEnvValue(env.DREAM_MAX_MESSAGES, env.DAILY_DIGEST_MAX_MESSAGES),
+    DEFAULT_MAX_MESSAGES,
+    1000
+  );
+}
+
+function readDreamMaxTokens(env: Env): number {
+  return readPositiveInt(readFirstEnvValue(env.DREAM_MAX_TOKENS, env.DAILY_DIGEST_MAX_TOKENS), 3000, 8000);
+}
+
+function readDreamMemoryContextLimit(env: Env): number {
+  return readPositiveInt(
+    readFirstEnvValue(env.DREAM_MEMORY_CONTEXT_LIMIT, env.DAILY_DIGEST_MEMORY_CONTEXT_LIMIT),
+    DEFAULT_MEMORY_CONTEXT_LIMIT,
+    1000
+  );
+}
+
+function readDreamExcerptLimit(env: Env): number {
+  return readPositiveInt(readFirstEnvValue(env.DREAM_EXCERPT_LIMIT, env.DAILY_DIGEST_EXCERPT_LIMIT), DEFAULT_EXCERPT_LIMIT, 20);
 }
 
 function readPositiveInt(value: unknown, fallback: number, max: number): number {
@@ -435,9 +507,9 @@ function formatDailySummary(result: DailyDigestResult, dateLabel: string, messag
 async function callDigestModel(
   env: Env,
   prompt: string
-): Promise<DailyDigestResult | null> {
-  const model = readString(env.DREAM_MODEL);
-  if (!model) return null;
+): Promise<DigestModelCallResult> {
+  const model = readDreamModel(env);
+  if (!model) return { digest: null, reason: "missing_model" };
 
   const request: OpenAIChatRequest = {
     model,
@@ -446,7 +518,7 @@ async function callDigestModel(
       { role: "user", content: prompt }
     ],
     temperature: 0,
-    max_tokens: readPositiveInt(env.DREAM_MAX_TOKENS, 3000, 8000),
+    max_tokens: readDreamMaxTokens(env),
     response_format: {
       type: "json_object"
     },
@@ -455,16 +527,16 @@ async function callDigestModel(
 
   try {
     const response = await callOpenAICompat(env, request);
-    if (!response.ok) return null;
+    if (!response.ok) return { digest: null, reason: "model_error", model, status: response.status };
     const parsed = (await response.json()) as OpenAIChatResponse;
     const message = parsed.choices?.[0]?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
     const content = typeof message?.content === "string" ? message.content.trim() : "";
     const json = extractJsonObject(content);
-    if (!json) return null;
-    return normalizeDigestResult(json);
+    if (!json) return { digest: null, reason: "model_invalid_json", model };
+    return { digest: normalizeDigestResult(json), model };
   } catch (error) {
     console.error("dream model failed", error);
-    return null;
+    return { digest: null, reason: "model_error", model };
   }
 }
 
@@ -514,7 +586,7 @@ async function saveImportantExcerpts(
   input: { namespace: string; dateLabel: string; excerpts: ImportantExcerpt[]; fallbackMessageIds: string[] }
 ): Promise<number> {
   let saved = 0;
-  const limit = readPositiveInt(env.DREAM_EXCERPT_LIMIT, DEFAULT_EXCERPT_LIMIT, 20);
+  const limit = readDreamExcerptLimit(env);
 
   for (const excerpt of input.excerpts.slice(0, limit)) {
     const quote = readString(excerpt.quote);
@@ -576,19 +648,21 @@ export async function runDailyMemoryDigest(
   env: Env,
   namespace: string,
   options: { dateLabel?: string; force?: boolean } = {}
-): Promise<{ ran: boolean; stats?: DailyDigestStats }> {
-  if (!isDreamEnabled(env)) return { ran: false };
+): Promise<DailyDigestRunResult> {
+  if (!isDreamEnabled(env)) return { ran: false, mode: "dream", reason: "dream_disabled" };
 
-  const timeZone = readString(env.DREAM_TIME_ZONE) || DEFAULT_TIME_ZONE;
+  const timeZone = readDreamTimeZone(env);
   const dateLabel = readString(options.dateLabel) || getTargetDigestDateLabel(timeZone);
   const { startIso, endIso } = getDateRangeForLabel(dateLabel, timeZone);
   const cursorName = `dream:${namespace}:${dateLabel}`;
   const legacyCursorName = `daily_digest:${namespace}:${dateLabel}`;
   const cursor = (await readCursor(env.DB, cursorName)) ?? (await readCursor(env.DB, legacyCursorName));
   const cursorState = options.force ? { done: false, after: null } : readDailyCursor(cursor, startIso, endIso);
-  if (cursorState.done) return { ran: false };
+  if (cursorState.done) {
+    return { ran: false, mode: "dream", date: dateLabel, reason: "already_done", startIso, endIso, cursor };
+  }
 
-  const maxMessages = readPositiveInt(env.DREAM_MAX_MESSAGES, DEFAULT_MAX_MESSAGES, 1000);
+  const maxMessages = readDreamMaxMessages(env);
   const messages = await listMessagesByNamespaceInRange(env.DB, {
     namespace,
     startCreatedAt: startIso,
@@ -598,16 +672,12 @@ export async function runDailyMemoryDigest(
   });
   if (messages.length === 0) {
     await writeCursor(env.DB, cursorName, `done:${cursorState.after ?? startIso}`);
-    return { ran: false };
+    return { ran: false, mode: "dream", date: dateLabel, reason: "no_messages", startIso, endIso, cursor };
   }
 
   const lastMessage = messages[messages.length - 1];
   const hasMore = messages.length >= maxMessages;
-  const memoryContextLimit = readPositiveInt(
-    env.DREAM_MEMORY_CONTEXT_LIMIT,
-    DEFAULT_MEMORY_CONTEXT_LIMIT,
-    1000
-  );
+  const memoryContextLimit = readDreamMemoryContextLimit(env);
   let existingMemories: MemoryApiRecord[] = [];
   try {
     existingMemories = (await listVectorMemories(env, {
@@ -625,13 +695,29 @@ export async function runDailyMemoryDigest(
     endIso,
     messages,
     existingMemories,
-    excerptLimit: readPositiveInt(env.DREAM_EXCERPT_LIMIT, DEFAULT_EXCERPT_LIMIT, 20),
+    excerptLimit: readDreamExcerptLimit(env),
     hasMore
   });
-  const digest = await callDigestModel(env, prompt);
+  const modelResult = await callDigestModel(env, prompt);
+  const digest = modelResult.digest;
   if (!digest) {
-    console.error("dream: model did not return valid JSON; cursor not advanced");
-    return { ran: false };
+    console.error("dream: model did not return valid JSON; cursor not advanced", {
+      reason: modelResult.reason,
+      model: modelResult.model,
+      status: modelResult.status
+    });
+    return {
+      ran: false,
+      mode: "dream",
+      date: dateLabel,
+      reason: modelResult.reason ?? "model_error",
+      startIso,
+      endIso,
+      cursor,
+      processedMessages: messages.length,
+      model: modelResult.model,
+      status: modelResult.status
+    };
   }
   const summaryContent = formatDailySummary(digest, dateLabel, messages);
   const messageIds = messages.map((message) => message.id);

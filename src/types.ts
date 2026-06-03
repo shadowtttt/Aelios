@@ -20,6 +20,7 @@ export interface Env {
   ENABLE_AUTO_MEMORY?: string;
   ENABLE_INCREMENTAL_MEMORY?: string;
   ENABLE_DREAM?: string;
+  ENABLE_DAILY_MEMORY_DIGEST?: string;
   DREAM_NAMESPACE?: string;
   DREAM_MAX_MESSAGES?: string;
   DREAM_MAX_RUNS?: string;
@@ -28,6 +29,14 @@ export interface Env {
   DREAM_MEMORY_CONTEXT_LIMIT?: string;
   DREAM_EXCERPT_LIMIT?: string;
   DREAM_TIME_ZONE?: string;
+  DAILY_DIGEST_MAX_MESSAGES?: string;
+  DAILY_DIGEST_MAX_RUNS?: string;
+  DAILY_DIGEST_MAX_TOKENS?: string;
+  DAILY_DIGEST_MODEL?: string;
+  SUMMARY_MODEL?: string;
+  DAILY_DIGEST_MEMORY_CONTEXT_LIMIT?: string;
+  DAILY_DIGEST_EXCERPT_LIMIT?: string;
+  DAILY_DIGEST_TIME_ZONE?: string;
   ENABLE_DAILY_SUMMARY_MEMORY?: string;
   EMPTY_MEMORY_MIN_CHARS?: string;
   MEMORY_MODE?: string;

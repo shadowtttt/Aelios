@@ -120,7 +120,7 @@ export async function maybeUpdateLongTermSummary(
   env: Env,
   namespace: string
 ): Promise<{ updated: boolean }> {
-  const model = env.DREAM_MODEL;
+  const model = env.DREAM_MODEL || env.DAILY_DIGEST_MODEL || env.SUMMARY_MODEL;
   if (!model) return { updated: false };
 
   const latest = await getLatestSummary(env.DB, namespace);
