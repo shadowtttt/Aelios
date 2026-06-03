@@ -76,6 +76,7 @@ interface DailyDigestSkipped {
   processedMessages?: number;
   model?: string;
   status?: number;
+  finishReason?: string | null;
 }
 
 type DailyDigestRunResult = { ran: true; stats: DailyDigestStats } | DailyDigestSkipped;
@@ -85,10 +86,11 @@ interface DigestModelCallResult {
   reason?: Extract<DailyDigestSkipReason, "missing_model" | "model_error" | "model_invalid_json">;
   model?: string;
   status?: number;
+  finishReason?: string | null;
 }
 
-const DEFAULT_MAX_MESSAGES = 320;
-const DEFAULT_MEMORY_CONTEXT_LIMIT = 250;
+const DEFAULT_MAX_MESSAGES = 120;
+const DEFAULT_MEMORY_CONTEXT_LIMIT = 80;
 const DEFAULT_EXCERPT_LIMIT = 8;
 const DEFAULT_EMPTY_MEMORY_MIN_CHARS = 4;
 const DEFAULT_TIME_ZONE = "Asia/Singapore";
@@ -529,10 +531,12 @@ async function callDigestModel(
     const response = await callOpenAICompat(env, request);
     if (!response.ok) return { digest: null, reason: "model_error", model, status: response.status };
     const parsed = (await response.json()) as OpenAIChatResponse;
-    const message = parsed.choices?.[0]?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
+    const choice = parsed.choices?.[0];
+    const message = choice?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
     const content = typeof message?.content === "string" ? message.content.trim() : "";
-    const json = extractJsonObject(content);
-    if (!json) return { digest: null, reason: "model_invalid_json", model };
+    const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
+    const json = extractJsonObject(content || reasoning);
+    if (!json) return { digest: null, reason: "model_invalid_json", model, finishReason: choice?.finish_reason };
     return { digest: normalizeDigestResult(json), model };
   } catch (error) {
     console.error("dream model failed", error);
@@ -716,7 +720,8 @@ export async function runDailyMemoryDigest(
       cursor,
       processedMessages: messages.length,
       model: modelResult.model,
-      status: modelResult.status
+      status: modelResult.status,
+      finishReason: modelResult.finishReason
     };
   }
   const summaryContent = formatDailySummary(digest, dateLabel, messages);
