@@ -12,6 +12,7 @@
     "verify": "npm run typecheck && node scripts/verify-assembler.mjs",
     "vectorize:clean": "node scripts/clean-vectorize-memory.mjs",
     "vectorize:clean:llm": "node scripts/llm-clean-vectorize-memory.mjs",
+    "memory:deep-clean": "node scripts/deep-clean-memories.mjs",
     "cache:test": "node scripts/test-claude-cache.mjs",
     "db:migrate:local": "wrangler d1 migrations apply companion_memory_proxy --local",
     "db:migrate:remote": "wrangler d1 migrations apply companion_memory_proxy --remote"
